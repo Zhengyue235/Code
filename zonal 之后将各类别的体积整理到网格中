@@ -1,0 +1,141 @@
+import pandas as pd
+import geopandas as gpd
+
+csv_file = r"C:\Users\MSI\Desktop\D\zhusanjiao.csv"
+gdb = r"E:\OSM_AOI_temp\Pop_centered_fishnet_degree.gdb"
+
+layer = "zhusanjiao"
+out_layer = "zhusanjiao11"
+
+# 统一后的分类名称及顺序
+types = [
+    "Industrial",
+    "Residential",
+    "Governmental",
+    "Educational",
+    "Medical",
+    "Commercial",
+    "Public"
+]
+class_mapping = {
+    "industrial": "Industrial",
+
+    "residential": "Residential",
+
+    "government": "Governmental",
+    "governmental": "Governmental",
+
+    "education": "Educational",
+    "educational": "Educational",
+
+    "hospital": "Medical",
+    "medical": "Medical",
+    "healthcare": "Medical",
+
+    "commercial": "Commercial",
+
+    "public": "Public"
+}
+df = pd.read_csv(csv_file)
+df["class_std"] = (
+    df["class_pred"]
+    .astype("string")
+    .str.strip()
+    .str.lower()
+    .map(class_mapping)
+)
+unknown_types = (
+    df.loc[df["class_std"].isna(), "class_pred"]
+    .dropna()
+    .astype(str)
+    .str.strip()
+    .unique()
+)
+
+if len(unknown_types) > 0:
+    raise ValueError(
+        f"发现尚未统一的分类名称：{unknown_types.tolist()}，"
+        "请补充到 class_mapping 中。"
+    )
+
+# 按统一后的 class_std 分组
+table = (
+    df.groupby(
+        ["OBJECTID_1", "class_std"],
+        as_index=False
+    )["Volume"]
+    .sum()
+    .pivot(
+        index="OBJECTID_1",
+        columns="class_std",
+        values="Volume"
+    )
+    .fillna(0)
+    .reset_index()
+)
+
+# 确保七种类型全部存在
+for t in types:
+    if t not in table.columns:
+        table[t] = 0
+
+# 固定字段顺序
+table = table[["OBJECTID_1"] + types]
+
+# 读取鱼网
+grid = gpd.read_file(
+    gdb,
+    layer=layer
+)
+
+print("Fishnet fields:")
+print(grid.columns.tolist())
+
+print("Standardized CSV categories:")
+print(table.columns.tolist())
+
+# 删除鱼网中已有的旧分类字段，防止合并后重复
+old_category_fields = [
+    "Industrial",
+    "Residential",
+    "Government",
+    "Governmental",
+    "Education",
+    "Educational",
+    "Hospital",
+    "Healthcare",
+    "Medical",
+    "Commercial",
+    "Public"
+]
+
+grid = grid.drop(
+    columns=[
+        col for col in old_category_fields
+        if col in grid.columns
+    ],
+    errors="ignore"
+)
+
+# 合并
+grid = grid.merge(
+    table,
+    left_on="OID",
+    right_on="OBJECTID_1",
+    how="left"
+)
+grid.drop(
+    columns=["OBJECTID_1"],
+    inplace=True,
+    errors="ignore"
+)
+grid[types] = grid[types].fillna(0)
+out_file = r"E:\OSM_AOI_temp\zhusanjiao11.gpkg"
+out_layer = "zhusanjiao11"
+
+grid.to_file(
+    out_file,
+    layer=out_layer,
+    driver="GPKG",
+    index=False
+)
