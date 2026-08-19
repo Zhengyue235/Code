@@ -1,0 +1,165 @@
+from pathlib import Path
+
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import dijkstra
+from scipy.spatial import cKDTree
+
+
+# ---------- Parameters to edit ----------
+GDB = r"E:\OSM_AOI_temp\Beijing.gdb"
+LAYER = "zhusanjiao11"
+OUT = r"E:\OSM_AOI_temp\Changsha11_commercial_access.gpkg"
+
+FIELD_COMMERCIAL = "Commercial"       # Commercial building volume
+FIELD_COMMERCIAL_SHARE = "ComP"      # Commercial volume share
+FIELD_RESIDENTIAL = "Residential"    # Residential building volume
+FIELD_POPULATION = "grid_code"       # Population; retained as a demand weight
+MODE_FIELDS = {"car": "friction", "walk": "Friction_walk"}  # min/m
+
+COMMERCIAL_SHARE_MIN = 0.5            # Strictly greater than 0.5
+RESIDENTIAL_VOLUME_MIN = 0.0          # Residential origin: volume > 0
+TIME_LIMITS = (15, 30)                # minutes
+SIGMA_RATIO = 0.5                     # sigma_T = T * 0.5; weight at T = exp(-2)
+NEIGHBORS = 8                         # 8-neighbour regular grid
+NEIGHBOR_FACTOR = 1.50                # max edge length / grid spacing
+BATCH_SIZE = 128                      # reduce this if memory is insufficient
+# ----------------------------------------
+
+
+def numeric(gdf, field):
+    return pd.to_numeric(gdf[field], errors="coerce").to_numpy(float)
+
+
+def build_graph(gdf, friction_field):
+    xy = np.c_[gdf.geometry.centroid.x, gdf.geometry.centroid.y]
+    n = len(xy)
+    k = min(NEIGHBORS + 1, n)
+    distances, indices = cKDTree(xy).query(xy, k=k)
+    if k == 1:
+        raise ValueError("At least two grid cells are required.")
+    spacing = float(np.median(distances[:, 1]))
+    rows = np.repeat(np.arange(n), k - 1)
+    cols = indices[:, 1:].reshape(-1)
+    lens = distances[:, 1:].reshape(-1)
+    a, b = np.minimum(rows, cols), np.maximum(rows, cols)
+    pair_code = a.astype(np.int64) * n + b
+    _, keep = np.unique(pair_code, return_index=True)
+    a, b, lens = a[keep], b[keep], lens[keep]
+
+    friction = numeric(gdf, friction_field)
+    good = (
+        (lens <= spacing * NEIGHBOR_FACTOR)
+        & np.isfinite(friction[a]) & np.isfinite(friction[b])
+        & (friction[a] > 0) & (friction[b] > 0)
+    )
+    a, b, lens = a[good], b[good], lens[good]
+    travel_minutes = lens * (friction[a] + friction[b]) / 2.0
+
+    return coo_matrix(
+        (np.r_[travel_minutes, travel_minutes],
+         (np.r_[a, b], np.r_[b, a])),
+        shape=(n, n),
+    ).tocsr()
+
+
+def calculate_mode(calc_gdf, result_gdf, mode, friction_field, commercial, residential, volume):
+    graph = build_graph(calc_gdf, friction_field)
+    destinations = np.flatnonzero(commercial)
+    origins = np.flatnonzero(residential)
+    if len(destinations) == 0 or len(origins) == 0:
+        raise ValueError("No eligible commercial or residential grid was found.")
+
+    limit_max = max(TIME_LIMITS)
+    state = {}
+    for limit in TIME_LIMITS:
+        state[limit] = {
+            "near_j": np.full(len(origins), -1, int),
+            "near_t": np.full(len(origins), np.inf),
+            "near_cs": np.full(len(origins), np.nan),
+            "best_j": np.full(len(origins), -1, int),
+            "best_t": np.full(len(origins), np.nan),
+            "best_cs": np.full(len(origins), -np.inf),
+            "sum_cs": np.zeros(len(origins)),
+        }
+
+    for start in range(0, len(destinations), BATCH_SIZE):
+        dest = destinations[start:start + BATCH_SIZE]
+        times = dijkstra(graph, directed=False, indices=dest, limit=limit_max)
+        if times.ndim == 1:
+            times = times[None, :]
+        times = times[:, origins]
+        log_capacity = np.log1p(np.maximum(volume[dest], 0.0))[:, None]
+        origin_columns = np.arange(len(origins))
+
+        for limit in TIME_LIMITS:
+            s = state[limit]
+            valid = np.isfinite(times) & (times <= limit)
+            coverage = np.exp(-0.5 * (times / (limit * SIGMA_RATIO)) ** 2)
+            score = np.where(valid, log_capacity * coverage, -np.inf)
+            s["sum_cs"] += np.where(valid, score, 0.0).sum(axis=0)
+
+            masked_time = np.where(valid, times, np.inf)
+            local = masked_time.argmin(axis=0)
+            local_time = masked_time[local, origin_columns]
+            update = local_time < s["near_t"]
+            s["near_j"][update] = dest[local[update]]
+            s["near_t"][update] = local_time[update]
+            s["near_cs"][update] = score[local[update], origin_columns[update]]
+
+            local = score.argmax(axis=0)
+            local_score = score[local, origin_columns]
+            update = local_score > s["best_cs"]
+            s["best_j"][update] = dest[local[update]]
+            s["best_t"][update] = times[local[update], origin_columns[update]]
+            s["best_cs"][update] = local_score[update]
+
+    n = len(result_gdf)
+    for limit, s in state.items():
+        for name in ("near_t", "near_cs", "best_t", "best_cs"):
+            s[name][~np.isfinite(s[name])] = np.nan
+        for name, values in s.items():
+            fill = -1 if name.endswith("_j") else np.nan
+            full = np.full(n, fill, dtype=int if name.endswith("_j") else float)
+            full[origins] = values
+            result_gdf[f"{mode}{limit}_{name}"] = full
+
+
+def main():
+    source = gpd.read_file(GDB, layer=LAYER, engine="pyogrio")
+    needed = {
+        FIELD_COMMERCIAL, FIELD_COMMERCIAL_SHARE, FIELD_RESIDENTIAL,
+        FIELD_POPULATION, *MODE_FIELDS.values(),
+    }
+    missing = sorted(needed - set(source.columns))
+    if missing:
+        raise KeyError(f"Missing fields: {missing}\nAvailable fields: {list(source.columns)}")
+    if source.crs is None:
+        raise ValueError("The layer has no CRS. Define a CRS whose distance unit is metres first.")
+
+    result = source.copy()
+    result["grid_id"] = np.arange(len(result), dtype=int)
+    calc = source.to_crs(source.estimate_utm_crs()) if source.crs.is_geographic else source
+
+    commercial_volume = numeric(source, FIELD_COMMERCIAL)
+    commercial = (
+        (numeric(source, FIELD_COMMERCIAL_SHARE) > COMMERCIAL_SHARE_MIN)
+        & (commercial_volume > 0)
+    )
+    residential = numeric(source, FIELD_RESIDENTIAL) > RESIDENTIAL_VOLUME_MIN
+
+    for mode, friction_field in MODE_FIELDS.items():
+        calculate_mode(
+            calc, result, mode, friction_field,
+            commercial, residential, commercial_volume,
+        )
+
+    result.to_file(OUT, layer="commercial_access", driver="GPKG", engine="pyogrio")
+    print(f"Saved: {Path(OUT)}")
+
+
+if __name__ == "__main__":
+    main()
+    
